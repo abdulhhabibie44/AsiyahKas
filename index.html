@@ -556,7 +556,7 @@ function __decodeAndRun(b64) {
 /* ============================== DB LAYER (Google Sheets via Apps Script) ============================== */
 // Opsional: isi URL Web App di sini supaya semua perangkat otomatis tersambung
 // tanpa perlu mengetik URL. PIN tetap diminta di setiap perangkat.
-const DEFAULT_API_URL = "https://script.google.com/macros/s/AKfycbzFRkKBz0j_NapOjER05eeDSllsCE2VFqzoqmU3KcdQCn2qVhoSeAWRyy7cAEl2FRBuHw/exec";
+const DEFAULT_API_URL = "";
 
 const LS_URL = "kas_api_url";
 const LS_PIN = "kas_api_pin";
@@ -623,7 +623,7 @@ const DB = {
   async deleteTransaksi(id) { applySnapshot(await callApi("delete", { id })); },
   async setSettings(obj) { applySnapshot(await callApi("setSettings", { settings: obj })); },
   async importAll(payload) { applySnapshot(await callApi("importAll", payload, 90000)); },
-  async clearAll() { applySnapshot(await callApi("clearAll")); },
+  async clearAll(pin) { applySnapshot(await callApi("clearAll", pin ? { pin } : {})); },
 };
 
 // Membaca database lama (IndexedDB) di perangkat ini, untuk migrasi satu kali ke Google Sheets.
@@ -802,6 +802,39 @@ function askConfirm(text, okLabel = "Hapus", tone = "danger") {
     const onCancel = () => cleanup(false);
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
+  });
+}
+
+/* Dialog verifikasi PIN. Mengembalikan PIN yang diketik, atau null jika dibatalkan.
+   PIN dicek oleh server saat aksi dijalankan (bukan hanya di perangkat). */
+function askPin(text, okLabel = "Hapus") {
+  return new Promise((resolve) => {
+    const old = document.getElementById("pin-backdrop");
+    if (old) old.remove();
+    const ov = el(`
+      <div id="pin-backdrop" class="fixed inset-0 z-50 flex items-center justify-center px-8" style="background-color:rgba(28,59,50,.5);">
+        <div class="rounded-2xl p-5 w-full" style="background-color:var(--paper); max-width:22rem;">
+          <p class="text-sm mb-3" style="color:var(--ink);">${escapeHtml(text)}</p>
+          <input id="pin-input" type="password" autocomplete="off" placeholder="Masukkan PIN" class="w-full rounded-xl px-4 py-3 text-sm outline-none border-2 border-transparent focus:border-[var(--emerald)]" style="background-color:var(--paper-raised); border-color:var(--line); color:var(--ink);">
+          <p id="pin-msg" class="text-xs" style="color:var(--debit); min-height:18px; margin:6px 0 8px;"></p>
+          <div class="flex gap-3">
+            <button id="pin-cancel" type="button" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Batal</button>
+            <button id="pin-ok" type="button" class="flex-1 py-3 rounded-xl text-sm font-bold" style="background-color:var(--debit); color:#fff;">${escapeHtml(okLabel)}</button>
+          </div>
+        </div>
+      </div>`);
+    document.body.appendChild(ov);
+    const input = ov.querySelector("#pin-input");
+    const msg = ov.querySelector("#pin-msg");
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector("#pin-cancel").addEventListener("click", () => done(null));
+    const submit = () => {
+      if (!input.value) { msg.textContent = "PIN wajib diisi"; return; }
+      done(input.value);
+    };
+    ov.querySelector("#pin-ok").addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    setTimeout(() => input.focus(), 50);
   });
 }
 
@@ -1280,10 +1313,16 @@ function renderPengaturan() {
   }));
 
   wrap.querySelector("#btn-reset").addEventListener("click", guard(async () => {
-    const ok = await askConfirm("Semua transaksi dan pengaturan akan dihapus permanen dari Google Sheets (berlaku untuk semua perangkat). Yakin?");
-    if (!ok) return;
-    setLoading(true, "Menghapus data...");
-    await DB.clearAll();
+    const pin = await askPin("Semua transaksi dan pengaturan akan dihapus permanen dari Google Sheets (berlaku untuk semua perangkat). Masukkan PIN untuk melanjutkan.");
+    if (pin === null) return;
+    setLoading(true, "Memverifikasi PIN...");
+    try {
+      await DB.clearAll(pin);
+    } catch (err) {
+      setLoading(false);
+      if (err.code === "AUTH") { showToast("PIN salah. Data tidak dihapus", "error"); return; }
+      throw err;
+    }
     state.settings = { ...DEFAULT_SETTINGS };
     state.transaksi = [];
     setLoading(false);
