@@ -553,96 +553,104 @@ function __decodeAndRun(b64) {
 <script>(function () {
 "use strict";
 
-/* ============================== DB LAYER ============================== */
-const DB_NAME = "musholla-keuangan-db";
-const DB_VERSION = 1;
-let dbInstance = null;
+/* ============================== DB LAYER (Google Sheets via Apps Script) ============================== */
+// Opsional: isi URL Web App di sini supaya semua perangkat otomatis tersambung
+// tanpa perlu mengetik URL. PIN tetap diminta di setiap perangkat.
+const DEFAULT_API_URL = "https://script.google.com/macros/s/AKfycbzFRkKBz0j_NapOjER05eeDSllsCE2VFqzoqmU3KcdQCn2qVhoSeAWRyy7cAEl2FRBuHw/exec";
 
-function openDB() {
-  return new Promise((resolve, reject) => {
-    if (dbInstance) return resolve(dbInstance);
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains("transaksi")) {
-        const store = db.createObjectStore("transaksi", { keyPath: "id", autoIncrement: true });
-        store.createIndex("tanggal", "tanggal", { unique: false });
-      }
-      if (!db.objectStoreNames.contains("pengaturan")) {
-        db.createObjectStore("pengaturan", { keyPath: "key" });
-      }
-    };
-    req.onsuccess = (e) => { dbInstance = e.target.result; resolve(dbInstance); };
-    req.onerror = (e) => reject(e.target.error);
-  });
+const LS_URL = "kas_api_url";
+const LS_PIN = "kas_api_pin";
+const LS_CACHE = "kas_cache_v1";
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
+
+const Conn = {
+  get url() { return lsGet(LS_URL) || DEFAULT_API_URL || ""; },
+  get pin() { return lsGet(LS_PIN) || ""; },
+  get ok() { return !!(this.url && this.pin); },
+  save(url, pin) { lsSet(LS_URL, url.trim()); lsSet(LS_PIN, pin); },
+  clear() { lsDel(LS_URL); lsDel(LS_PIN); lsDel(LS_CACHE); },
+};
+
+async function callApi(action, payload = {}, timeoutMs = 30000) {
+  if (!Conn.ok) { const e = new Error("Belum tersambung ke Google Sheets"); e.code = "AUTH"; throw e; }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    // text/plain = "simple request": tidak memicu preflight CORS yang tidak didukung Apps Script.
+    res = await fetch(Conn.url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action, pin: Conn.pin, ...payload }),
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") throw new Error("Server terlalu lama merespons, coba lagi");
+    throw new Error("Tidak dapat terhubung. Periksa koneksi internet");
+  } finally {
+    clearTimeout(timer);
+  }
+  let data;
+  try { data = await res.json(); }
+  catch (e) { throw new Error("Respons server tidak valid. Pastikan URL Web App benar dan akses diset ke \"Anyone\""); }
+  if (!data.ok) { const e = new Error(data.error || "Permintaan ditolak server"); e.code = data.code; throw e; }
+  return data;
 }
 
-function tx(storeName, mode) {
-  return openDB().then((db) => db.transaction(storeName, mode).objectStore(storeName));
+// Terapkan hasil dari server ke state + simpan cache untuk buka cepat / mode offline (baca saja).
+function applySnapshot(data) {
+  state.settings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
+  state.settings.saldoAwal = parseAngka(state.settings.saldoAwal);
+  state.transaksi = (data.transaksi || []).map((t) => ({
+    id: Number(t.id),
+    tanggal: String(t.tanggal || ""),
+    uraian: String(t.uraian || ""),
+    pemasukan: Number(t.pemasukan) || 0,
+    pengeluaran: Number(t.pengeluaran) || 0,
+  }));
+  if (data.sheetUrl) state.sheetUrl = data.sheetUrl;
+  state.lastSync = Date.now();
+  lsSet(LS_CACHE, JSON.stringify({ settings: state.settings, transaksi: state.transaksi, sheetUrl: state.sheetUrl, at: state.lastSync }));
 }
 
 const DB = {
-  async getAllTransaksi() {
-    const store = await tx("transaksi", "readonly");
-    return new Promise((resolve, reject) => {
-      const req = store.getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async addTransaksi(item) {
-    const store = await tx("transaksi", "readwrite");
-    return new Promise((resolve, reject) => {
-      const req = store.add(item);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async putTransaksi(item) {
-    const store = await tx("transaksi", "readwrite");
-    return new Promise((resolve, reject) => {
-      const req = store.put(item);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async deleteTransaksi(id) {
-    const store = await tx("transaksi", "readwrite");
-    return new Promise((resolve, reject) => {
-      const req = store.delete(id);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async getAllSettings() {
-    const store = await tx("pengaturan", "readonly");
-    return new Promise((resolve, reject) => {
-      const req = store.getAll();
-      req.onsuccess = () => {
-        const out = {};
-        (req.result || []).forEach((r) => (out[r.key] = r.value));
-        resolve(out);
-      };
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async setSetting(key, value) {
-    const store = await tx("pengaturan", "readwrite");
-    return new Promise((resolve, reject) => {
-      const req = store.put({ key, value });
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
-  },
-  async clearAll() {
-    const s1 = await tx("transaksi", "readwrite");
-    const s2 = await tx("pengaturan", "readwrite");
-    await Promise.all([
-      new Promise((res) => { const r = s1.clear(); r.onsuccess = res; }),
-      new Promise((res) => { const r = s2.clear(); r.onsuccess = res; }),
-    ]);
-  },
+  async fetchAll() { applySnapshot(await callApi("all")); },
+  async addTransaksi(item) { const d = await callApi("add", { item }); applySnapshot(d); return d.id; },
+  async putTransaksi(item) { applySnapshot(await callApi("update", { item })); },
+  async deleteTransaksi(id) { applySnapshot(await callApi("delete", { id })); },
+  async setSettings(obj) { applySnapshot(await callApi("setSettings", { settings: obj })); },
+  async importAll(payload) { applySnapshot(await callApi("importAll", payload, 90000)); },
+  async clearAll() { applySnapshot(await callApi("clearAll")); },
 };
+
+// Membaca database lama (IndexedDB) di perangkat ini, untuk migrasi satu kali ke Google Sheets.
+function readLegacyLocal() {
+  return new Promise((resolve) => {
+    if (!window.indexedDB) return resolve(null);
+    let req;
+    try { req = indexedDB.open("musholla-keuangan-db"); } catch (e) { return resolve(null); }
+    req.onupgradeneeded = (e) => { try { e.target.transaction.abort(); } catch (_) {} }; // DB belum ada: jangan dibuat
+    req.onerror = () => resolve(null);
+    req.onblocked = () => resolve(null);
+    req.onsuccess = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("transaksi")) { db.close(); return resolve(null); }
+      const names = ["transaksi"];
+      if (db.objectStoreNames.contains("pengaturan")) names.push("pengaturan");
+      const t = db.transaction(names, "readonly");
+      const out = { transaksi: [], settings: {} };
+      t.objectStore("transaksi").getAll().onsuccess = (ev) => { out.transaksi = ev.target.result || []; };
+      if (names.length > 1) {
+        t.objectStore("pengaturan").getAll().onsuccess = (ev) => (ev.target.result || []).forEach((r) => { out.settings[r.key] = r.value; });
+      }
+      t.oncomplete = () => { db.close(); resolve(out); };
+      t.onerror = t.onabort = () => { db.close(); resolve(null); };
+    };
+  });
+}
 
 const DEFAULT_SETTINGS = {
   namaMusholla: "Musholla Aisyah",
@@ -664,6 +672,8 @@ const state = {
   riwayatFilter: "",
   riwayatDari: "",
   riwayatSampai: "",
+  sheetUrl: "",
+  lastSync: 0,
 };
 
 /* ============================== HELPERS ============================== */
@@ -1075,6 +1085,77 @@ function getExportRange(wrap) {
 }
 
 /* ============================== RENDER: PENGATURAN ============================== */
+function connLabel() {
+  try {
+    const u = new URL(Conn.url);
+    const id = u.pathname.split("/").filter(Boolean).pop() || "";
+    return `Web App: ${u.hostname}/…/${id.slice(0, 6)}…`;
+  } catch (e) { return "URL belum diatur"; }
+}
+function syncLabel() {
+  if (!state.lastSync) return "Belum pernah sinkron di sesi ini";
+  const d = new Date(state.lastSync);
+  return "Sinkron terakhir: " + d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+}
+
+/* Layar sambungan: URL Web App + PIN. Menyelesaikan promise saat berhasil tersambung. */
+function showSetup(message) {
+  return new Promise((resolve) => {
+    const old = document.getElementById("setup-overlay");
+    if (old) old.remove();
+    const inputCls = "w-full rounded-xl px-4 py-3 text-sm outline-none border-2 border-transparent focus:border-[var(--emerald)]";
+    const inputSty = "background-color:var(--paper-raised); border-color:var(--line); color:var(--ink);";
+    const ov = el(`
+      <div id="setup-overlay" class="fixed inset-0 z-[70] px-5" style="background-color:var(--paper); overflow-y:auto; padding-top:max(env(safe-area-inset-top),24px); padding-bottom:24px;">
+        <div style="max-width:28rem; margin:0 auto;">
+          <p class="text-center" style="font-size:44px; margin-top:24px;">&#128332;</p>
+          <h1 class="text-center font-bold" style="font-size:20px; color:var(--ink); margin-top:8px;">Sambungkan ke Google Sheets</h1>
+          <p class="text-center text-[11px]" style="color:var(--ink-soft); margin:6px 0 20px;">Masukkan URL Web App dan PIN dari langkah setup. Data akan tersimpan online dan bisa dibuka dari banyak perangkat.</p>
+          <div style="margin-bottom:14px;">
+            <label class="block text-xs font-semibold mb-2" style="color:var(--ink-soft)">URL Web App</label>
+            <input id="su-url" type="url" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="https://script.google.com/macros/s/.../exec" value="${escapeHtml(Conn.url)}" class="${inputCls}" style="${inputSty}">
+          </div>
+          <div style="margin-bottom:14px;">
+            <label class="block text-xs font-semibold mb-2" style="color:var(--ink-soft)">PIN</label>
+            <input id="su-pin" type="password" autocomplete="off" placeholder="PIN yang Anda tulis di Code.gs" class="${inputCls}" style="${inputSty}">
+          </div>
+          <p id="su-msg" class="text-xs" style="color:var(--debit); min-height:18px; margin-bottom:10px;">${escapeHtml(message || "")}</p>
+          <button id="su-go" type="button" class="w-full py-3.5 rounded-xl text-sm font-bold" style="background-color:var(--emerald); color:var(--paper);">Sambungkan</button>
+          <button id="su-cancel" type="button" class="w-full py-3 text-sm font-semibold mt-3" style="color:var(--ink-soft); display:none;">Batal</button>
+        </div>
+      </div>`);
+    document.body.appendChild(ov);
+    const msg = ov.querySelector("#su-msg");
+    const go = ov.querySelector("#su-go");
+    const cancel = ov.querySelector("#su-cancel");
+    if (Conn.ok) { cancel.style.display = "block"; cancel.addEventListener("click", () => { ov.remove(); resolve(false); }); }
+
+    go.addEventListener("click", async () => {
+      const url = ov.querySelector("#su-url").value.trim();
+      const pin = ov.querySelector("#su-pin").value;
+      msg.style.color = "var(--debit)";
+      if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(url) && !/^https:\/\/script\.google\.com\/a\/.+\/exec$/.test(url)) {
+        msg.textContent = "URL harus berupa Web App Apps Script yang berakhiran /exec"; return;
+      }
+      if (!pin) { msg.textContent = "PIN wajib diisi"; return; }
+      const prev = { url: lsGet(LS_URL), pin: lsGet(LS_PIN) };
+      Conn.save(url, pin);
+      go.disabled = true; go.textContent = "Menghubungkan...";
+      try {
+        await DB.fetchAll();
+        ov.remove();
+        resolve(true);
+      } catch (err) {
+        // kembalikan koneksi lama bila gagal
+        if (prev.url) lsSet(LS_URL, prev.url); else lsDel(LS_URL);
+        if (prev.pin) lsSet(LS_PIN, prev.pin); else lsDel(LS_PIN);
+        msg.textContent = err.message;
+        go.disabled = false; go.textContent = "Sambungkan";
+      }
+    });
+  });
+}
+
 function renderPengaturan() {
   const s = state.settings;
   const wrap = el(`<div class="px-5 pt-4 pb-6"></div>`);
@@ -1111,13 +1192,31 @@ function renderPengaturan() {
     </form>
 
     <div class="mt-8 pt-6" style="border-top:1px solid var(--line);">
+      <p class="text-xs font-semibold mb-3" style="color:var(--ink-soft)">Koneksi Google Sheets</p>
+      <div class="rounded-xl px-4 py-3 mb-3" style="background-color:var(--paper-raised); border:1px solid var(--line);">
+        <p class="text-sm font-semibold" style="color:var(--emerald)">&#9679; Tersambung</p>
+        <p class="text-[11px] mt-1" style="color:var(--ink-soft)">${escapeHtml(connLabel())}</p>
+        <p class="text-[11px]" style="color:var(--ink-soft)">${escapeHtml(syncLabel())}</p>
+      </div>
+      <div class="flex gap-3 mb-3">
+        <button id="btn-sync" type="button" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Sinkronkan</button>
+        <button id="btn-open-sheet" type="button" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Buka Spreadsheet</button>
+      </div>
+      <div class="flex gap-3 mb-3">
+        <button id="btn-import-legacy" type="button" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Impor Data Lama</button>
+        <button id="btn-change-conn" type="button" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Ganti Koneksi</button>
+      </div>
+      <p class="text-[11px]" style="color:var(--ink-soft)">"Impor Data Lama" memindahkan data yang sebelumnya tersimpan di perangkat ini (versi offline) ke Google Sheets.</p>
+    </div>
+
+    <div class="mt-8 pt-6" style="border-top:1px solid var(--line);">
       <p class="text-xs font-semibold mb-3" style="color:var(--ink-soft)">Cadangkan Data</p>
       <div class="flex gap-3 mb-3">
         <button id="btn-backup" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Unduh Cadangan</button>
         <button id="btn-restore" class="flex-1 py-3 rounded-xl text-sm font-semibold" style="background-color:var(--paper-raised); border:1px solid var(--line); color:var(--ink);">Pulihkan</button>
         <input id="input-restore" type="file" accept="application/json" class="hidden">
       </div>
-      <p class="text-[11px] mb-6" style="color:var(--ink-soft)">Data disimpan langsung di perangkat ini (IndexedDB). Unduh cadangan secara berkala agar data tidak hilang bila aplikasi/perangkat dihapus.</p>
+      <p class="text-[11px] mb-6" style="color:var(--ink-soft)">Data utama tersimpan online di Google Sheets. Unduh cadangan berkala sebagai arsip tambahan.</p>
 
       <p class="text-xs font-semibold mb-3" style="color:var(--debit)">Zona Berbahaya</p>
       <button id="btn-reset" class="w-full py-3 rounded-xl text-sm font-semibold" style="background-color:var(--debit-soft); color:var(--debit);">Hapus Semua Data</button>
@@ -1137,8 +1236,7 @@ function renderPengaturan() {
       namaBendahara: wrap.querySelector("#p-bendahara").value.trim(),
       tempat: wrap.querySelector("#p-tempat").value.trim(),
     };
-    for (const k of Object.keys(newSettings)) await DB.setSetting(k, newSettings[k]);
-    state.settings = newSettings;
+    await DB.setSettings(newSettings);
     setLoading(false);
     showToast("Pengaturan disimpan");
     render();
@@ -1170,15 +1268,11 @@ function renderPengaturan() {
     setLoading(true, "Memulihkan data...");
     const text = await file.text();
     const payload = JSON.parse(text);
-    await DB.clearAll();
+    const restSettings = {};
     for (const k of Object.keys(DEFAULT_SETTINGS)) {
-      if (payload.settings && payload.settings[k] !== undefined) await DB.setSetting(k, payload.settings[k]);
+      if (payload.settings && payload.settings[k] !== undefined) restSettings[k] = payload.settings[k];
     }
-    for (const t of payload.transaksi || []) {
-      const { id, ...rest } = t;
-      await DB.addTransaksi(rest);
-    }
-    await loadAll();
+    await DB.importAll({ settings: restSettings, transaksi: payload.transaksi || [] });
     setLoading(false);
     restoreInput.value = "";
     showToast("Data berhasil dipulihkan");
@@ -1186,7 +1280,7 @@ function renderPengaturan() {
   }));
 
   wrap.querySelector("#btn-reset").addEventListener("click", guard(async () => {
-    const ok = await askConfirm("Semua transaksi dan pengaturan akan dihapus permanen dari perangkat ini. Yakin?");
+    const ok = await askConfirm("Semua transaksi dan pengaturan akan dihapus permanen dari Google Sheets (berlaku untuk semua perangkat). Yakin?");
     if (!ok) return;
     setLoading(true, "Menghapus data...");
     await DB.clearAll();
@@ -1195,6 +1289,39 @@ function renderPengaturan() {
     setLoading(false);
     showToast("Semua data telah dihapus");
     setActiveTab("beranda");
+  }));
+
+  wrap.querySelector("#btn-sync").addEventListener("click", guard(async () => {
+    setLoading(true, "Menyinkronkan...");
+    try { await DB.fetchAll(); } finally { setLoading(false); }
+    showToast("Data terbaru dimuat");
+    render();
+  }));
+  wrap.querySelector("#btn-open-sheet").addEventListener("click", () => {
+    if (state.sheetUrl) window.open(state.sheetUrl, "_blank", "noopener");
+    else showToast("Sinkronkan dulu untuk mendapat tautan spreadsheet", "error");
+  });
+  wrap.querySelector("#btn-import-legacy").addEventListener("click", guard(async () => {
+    setLoading(true, "Memeriksa data lama...");
+    let legacy;
+    try { legacy = await readLegacyLocal(); } finally { setLoading(false); }
+    const n = legacy ? legacy.transaksi.length : 0;
+    if (!legacy || (n === 0 && Object.keys(legacy.settings).length === 0)) {
+      showToast("Tidak ada data lama di perangkat/alamat ini", "error");
+      return;
+    }
+    const ok = await askConfirm(`Ditemukan ${n} transaksi di perangkat ini. Seluruh data di Google Sheets akan DITIMPA dengan data ini. Lanjutkan?`, "Impor", "safe");
+    if (!ok) return;
+    setLoading(true, "Mengunggah ke Google Sheets...");
+    const settings = {};
+    for (const k of Object.keys(DEFAULT_SETTINGS)) if (legacy.settings[k] !== undefined) settings[k] = legacy.settings[k];
+    try { await DB.importAll({ settings, transaksi: legacy.transaksi }); } finally { setLoading(false); }
+    showToast(`${n} transaksi berhasil diimpor`);
+    render();
+  }));
+  wrap.querySelector("#btn-change-conn").addEventListener("click", guard(async () => {
+    await showSetup("");
+    render();
   }));
 
   return wrap;
@@ -1289,11 +1416,7 @@ function updateJenisButtons() {
   });
 }
 
-async function loadAll() {
-  const [settings, transaksi] = await Promise.all([DB.getAllSettings(), DB.getAllTransaksi()]);
-  state.settings = { ...DEFAULT_SETTINGS, ...settings };
-  state.transaksi = transaksi;
-}
+async function loadAll() { await DB.fetchAll(); }
 
 /* ============================== EXPORT: PDF ============================== */
 function filterByRange(range) {
@@ -1496,7 +1619,6 @@ function wireStaticEvents() {
     };
     if (id) { item.id = Number(id); await DB.putTransaksi(item); }
     else { await DB.addTransaksi(item); }
-    await loadAll();
     setLoading(false);
     closeSheet();
     showToast(id ? "Transaksi diperbarui" : "Transaksi disimpan");
@@ -1509,7 +1631,6 @@ function wireStaticEvents() {
     if (!ok) return;
     setLoading(true, "Menghapus...");
     await DB.deleteTransaksi(id);
-    await loadAll();
     setLoading(false);
     closeSheet();
     showToast("Transaksi dihapus");
@@ -1623,17 +1744,47 @@ function sheetIsOpen() {
 
 /* ============================== INIT ============================== */
 async function init() {
-  setLoading(true, "Memuat data...");
-  try {
-    await loadAll();
-  } catch (err) {
-    console.error(err);
-    showToast("Gagal memuat database perangkat", "error");
-  }
   wireStaticEvents();
   initPullToRefresh();
+
+  // 1) Tampilkan cache terakhir seketika (jika ada), lalu segarkan dari Google Sheets.
+  let hadCache = false;
+  try {
+    const c = JSON.parse(lsGet(LS_CACHE) || "null");
+    if (c && Array.isArray(c.transaksi)) {
+      state.settings = { ...DEFAULT_SETTINGS, ...c.settings };
+      state.transaksi = c.transaksi;
+      state.sheetUrl = c.sheetUrl || "";
+      hadCache = true;
+    }
+  } catch (e) {}
   render();
+
+  // 2) Belum tersambung -> minta URL + PIN.
+  if (!Conn.ok) { await showSetup(""); render(); return; }
+
+  if (!hadCache) setLoading(true, "Memuat data...");
+  try {
+    await DB.fetchAll();
+  } catch (err) {
+    console.error(err);
+    setLoading(false);
+    if (err.code === "AUTH") await showSetup(err.message);
+    else showToast(hadCache ? "Offline: menampilkan data terakhir" : "Gagal memuat: " + err.message, "error");
+  }
   setLoading(false);
+  render();
+
+  // 3) Segarkan otomatis saat aplikasi dibuka kembali (agar perubahan dari perangkat lain ikut tampil).
+  let lastFetch = Date.now();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !Conn.ok || busy || sheetIsOpen()) return;
+    if (Date.now() - lastFetch < 30000) return;
+    lastFetch = Date.now();
+    DB.fetchAll().then(() => {
+      if (!busy && !sheetIsOpen() && state.activeTab !== "pengaturan") render();
+    }).catch(() => {});
+  });
 }
 
 document.addEventListener("DOMContentLoaded", init);
